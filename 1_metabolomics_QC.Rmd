@@ -1,0 +1,642 @@
+---
+title: "COVID metabolon QC (Xenobiotics)"
+author: "Yulu Chen"
+output: 
+  html_document: 
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, include=FALSE}
+pkg <- c("tidyverse", "data.table", "here", "readxl", "matrixStats", "e1071", "GGally", "ggrepel", "openxlsx",
+         "FactoMineR", "factoextra")
+for (p in pkg) {
+        if (require(p, character.only = T)) {
+                print(paste0(p, " loaded successfully"))
+        } else {
+                install.packages(p)
+                require(p, character.only = T)
+                print(paste0(p, " downloaded and loaded successfully"))
+        }
+}
+
+
+## Paths
+
+dat_dir <- "data/"
+res_dir <- "results/"
+fig_dir <- "figures/"
+
+## File name
+
+dat_fname <- str_c(dat_dir, 'NATS-01-20PHML_DATA_TABLES.xlsx')
+mets_sname <- "Batch-normalized Data"
+mets_info_sname <- "Chemical Annotation"
+sam_info_sname <- "Sample Meta Data"
+
+## Hard-coded numbers
+
+cv_thld <- 0.25
+missing_thld <- 0.30 
+qc_rm_thld <- 0.75
+
+## Functions
+
+impute_halfmin <- function(x) {replace(x, is.na(x), (min(x, na.rm = T)/2))}
+pareto <- function(x) {(x-mean(x, na.rm = T))/sqrt(sd(x, na.rm = T))}
+```
+
+
+# 1. Read data
+## 1.1 Load Data
+```{r}
+
+mets <- read.xlsx(dat_fname, sheet = mets_sname) %>% data.table()
+mets_info <- read.xlsx(dat_fname, sheet = mets_info_sname) %>% data.table()
+sam_info <- read.xlsx(dat_fname, sheet = sam_info_sname) %>% data.table()
+
+pheno <- sam_info
+
+```
+
+## 1.2 Data statistic summary
+944 subjects and 1546 metabolites
+```{r}
+sam_info[, .N, .(GENDER)]
+
+sam_info[, .N, .(RACE_ETHNICITY)]
+
+summary(sam_info$AGE)
+
+ggplot(sam_info, aes(x = AGE, color = GENDER)) + geom_histogram(fill = "white") + labs(title = "Age histogram")
+```
+
+# 2. Extract data
+## 2.1 Rename Headers
+```{r}
+
+mets_info$Name <- paste0("X", mets_info$CHEM_ID)
+mets_info$Names <- paste0("X", mets_info$CHEM_ID)
+mets_list <- mets_info$Name 
+colnames(mets) <- c("PARENT_SAMPLE_NAME", mets_list)
+
+```
+
+## 2.2 Combine Sample Info and Metabolites
+```{r}
+mets <- merge(sam_info, mets, by = "PARENT_SAMPLE_NAME") %>% data.table() # 944 1564
+## c1 PARENT_SAMPLE_NAME
+
+mets_all <- mets
+```
+
+METABOLON Batch normalized data: 
+For each metabolite, the raw values in the experimental samples are divided by the median of those samples in each instrument batch, giving each batch and thus the metabolite  a median of one.  For studies containing < 144 total samples, typically no batch normalization is required and the Batch-normalized data simply reflect median-scaled raw data.  Please see "Batch and Batch Correction" section below for further details.
+
+# 3. Xenobiotics
+The super pathway information for all metabolites
+```{r}
+mets_info[, .N, SUPER_PATHWAY]
+length(is.na(mets_info$SUPER_PATHWAY) == TRUE) # all mets has super pathway information
+```
+The xenobiotics information
+```{r}
+xenobiotics<-subset(mets_info, SUPER_PATHWAY=="Xenobiotics")
+dim(xenobiotics)[1]
+xenobiotics[, .N, SUB_PATHWAY]
+```
+
+# 4. Missingness
+## 4.1 Missing in metabolites
+all metabolites
+```{r}
+mets_na <- as.data.frame(matrix(ncol = 2, nrow = length(mets_list)))
+colnames(mets_na) <- c("Metabolite Name", "NA percent")
+mets_na$`Metabolite Name` <- mets_list
+
+for (i in 1:length(mets_list)) {
+  eval(parse(text = str_c("mets_na[i,2] <- sum(is.na(mets_all[,", mets_list[i], "]))/944")))
+}
+
+summary(mets_na$`NA percent`)
+ggplot(mets_na, aes(x = `NA percent`)) + geom_histogram() + labs(title = "NA percent histogram for each metabolites")
+
+colnames(mets_na)[1] <- "Name"
+mets_info <- merge(mets_info, mets_na, by = "Name", all.x = T)
+colnames(mets_na)[1] <- "Metabolite Name"
+```
+Xenobiotics
+```{r}
+xen_list <- xenobiotics$CHEM_ID
+xen_list <- paste0("X", xen_list)
+
+xen_na <- as.data.frame(matrix(ncol = 2, nrow = length(xen_list)))
+colnames(xen_na) <- c("Xenobiotics Name", "NA percent")
+xen_na$`Xenobiotics Name` <- xen_list
+
+for (i in 1:length(xen_list)) {
+  eval(parse(text = str_c("xen_na[i,2] <- sum(is.na(mets_all[,", xen_list[i], "]))/944")))
+}
+
+summary(xen_na$`NA percent`)
+ggplot(xen_na, aes(x = `NA percent`)) + geom_histogram() + labs(title = "NA percent histogram for each Xenobiotics")
+
+```
+
+## 4.2 Missing in subjects
+```{r}
+sam_list <- sam_info$PARENT_SAMPLE_NAME
+
+sam_na <- as.data.frame(matrix(ncol = 2, nrow = length(sam_list)))
+colnames(sam_na) <- c("PARENT_SAMPLE_NAME", "NA percent")
+sam_na$PARENT_SAMPLE_NAME <- sam_list
+
+for (i in 1:length(sam_list)) {
+  sam_na[i,2] <- sum(is.na(mets_all[i,c(mets_list)]))/1546
+}
+
+summary(sam_na$`NA percent`)
+# ggplot(sam_na, aes(x = `NA percent`)) + geom_histogram() + labs(title = "NA percent histogram for each subject")
+
+```
+
+## 4.3 Remove metabolites with >= 75% missing except Xenobiotics
+remove 49 metabolites and 1497 metabolites left
+```{r}
+## Remove metabolites with >= 75% missing (these will have post-imputation IQR = 0 anyway)
+# 100% missing will cause warning when imputing with half minimum
+# mets_na_75 <- mets_list[! (mets_list %in% xen_list)] #1157
+# mets_na_75 <- mets_na_75[mets_na$`NA percent` >= 0.75]
+mets_list_exp_xeno <- mets_list[!(mets_list %in% xen_list)]
+mets_na_exp_xeno <- mets_na[!(mets_na$`Metabolite Name` %in% xen_list),]
+
+mets_na_75 <- mets_list_exp_xeno[mets_na_exp_xeno$`NA percent`>= 0.75]
+1546 - 389 - length(mets_na_75)
+
+eval(parse(text = str_c("mets_all <- subset(mets_all, select = -c(", mets_na_75, "))")))
+mets_list_qc75 <- mets_list[!(mets_list %in% mets_na_75)]
+mets_list_exp_xeno_qc75 <- mets_list_exp_xeno[!(mets_list_exp_xeno %in% mets_na_75)]
+```
+
+# 5. Impute with half minimum
+
+```{r}
+mets_all[, (mets_list_qc75) := lapply(.SD, impute_halfmin), .SDcols = mets_list_qc75]
+```
+
+# 6. Pre-processing statistics & PCA
+## 6.1 Pre-processing stats
+```{r}
+
+mets_pre_stats <- cbind(apply(mets_all[, ..mets_list_qc75], 2, min), 
+                        apply(mets_all[, ..mets_list_qc75], 2, max), 
+                        apply(mets_all[, ..mets_list_qc75], 2, IQR), 
+                        apply(mets_all[, ..mets_list_qc75], 2, skewness))
+mets_pre_stats <- as.data.frame(mets_pre_stats) %>% rownames_to_column() %>% as.data.table()
+setnames(mets_pre_stats, c("metabolite", "min", "max", "iqr_pre", "skewness_pre"))
+mets_pre_stats[, ':='(iqr_rank_pre = rank(iqr_pre, ties.method = "first"), 
+                      skewness_rank_pre = rank(skewness_pre, ties.method = "first"))]
+
+mets_pre_stats[min == max, ] # None
+
+colnames(mets_pre_stats)[1] <- "Name"
+mets_info_after_qc <- merge(mets_info, mets_pre_stats, by = "Name", all.y = T)
+
+write.csv(mets_info_after_qc, here(res_dir, "mets_qc_infor.csv"), row.names=FALSE)
+
+colnames(mets_pre_stats)[1] <- "metabolite"
+```
+
+IQR information
+```{r}
+mets_pre_stats[, .N, iqr_pre == 0]
+mets_pre_stats[, summary(iqr_pre)]
+
+ggplot(mets_pre_stats) + 
+        geom_point(aes(iqr_rank_pre, iqr_pre), size = 2, alpha = 0.5) + 
+        labs(title = "Pre-processing IQR (halfmin imputed)") +
+        labs(x = "Rank", y = "IQR") + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "iqr_preprocessing_halfmin.png"), width = 5, height = 5)
+
+```
+
+Skewness information
+222 out of 1497 Metabolites are skewed.
+```{r}
+mets_pre_stats[, summary(skewness_pre)]
+
+mets_pre_stats[, .N, skewness_pre>=2|skewness_pre<=-2]
+
+ggplot(mets_pre_stats) + 
+        geom_point(aes(skewness_rank_pre, skewness_pre), size = 2, alpha = 0.5) + 
+        labs(title = "Pre-processing skewness (halfmin imputed)") +
+        labs(x = "Rank", y = "Skewness") + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "skewness_preprocessing_halfmin.png"), width = 5, height = 5)
+
+
+```
+
+## 6.2 Drop metabolites with IQR = 0 except Xenobiotics
+217 metabolites with IQR = 0 but all these metabolites belongs to Xenobiotics so I didn't drop these metabolites
+```{r}
+
+# eval(parse(text = str_c("mets_pre_stats  <- subset(mets_pre_stats , select = -c(", xen_list, "))")))
+
+iqr_0_list <- mets_pre_stats[mets_pre_stats$iqr_pre == 0,]
+dim(iqr_0_list)[1]
+
+iqr_0_list <- iqr_0_list$metabolite
+length(intersect(iqr_0_list, xen_list))
+
+# eval(parse(text = str_c("mets_all <- subset(mets_all, select = -c(", iqr_0_list, "))")))
+# mets_list_qc75 <- mets_list_qc75[!(mets_list_qc75 %in% iqr_0_list)]
+
+```
+
+## 6.3 Pre-processing PCA
+The PC1 explained 12.4% variance and more than 34 PC can explain more than 50% variance
+```{r}
+
+pca_pre <- prcomp(mets_all[, ..mets_list_qc75], scale. = T)
+# summary(pca_pre)
+pca_pre$sdev[1]^2 / sum(pca_pre$sdev^2) 
+which((cumsum(pca_pre$sdev^2) / sum(pca_pre$sdev^2)) > 0.5)[1] 
+
+fviz_eig(pca_pre)
+
+pc_pre <- as.data.table(pca_pre$x)
+pc_pre <- cbind(pc_pre, sam_info) 
+
+ggplot(pc_pre, aes(x = PC1, y = PC2)) + 
+        geom_point(size = 2, alpha = 0.5) +
+        labs(title = "Pre-processing PC2 vs PC1 (halfmin imputed)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, PARENT_SAMPLE_NAME, "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "PC1_PC2_preprocessing_halfmin.png"))
+
+ggplot(pc_pre, aes(x = PC1, y = PC2)) + 
+        geom_point(aes(color = GENDER), size = 2, alpha = 0.5) + 
+        labs(title = "Pre-processing PC2 vs PC1 (halfmin imputed)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, PARENT_SAMPLE_NAME, "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+
+ggsave(here(fig_dir, "PC1_PC2_preprocessing_by_gender_halfmin.png"))
+
+ggplot(pc_pre, aes(x = PC1, y = PC2)) + 
+        geom_point(aes(color = AGE), size = 2, alpha = 0.5) + 
+        labs(title = "Pre-processing PC2 vs PC1 (halfmin imputed)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, PARENT_SAMPLE_NAME, "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+
+ggsave(here(fig_dir, "PC1_PC2_preprocessing_by_age_halfmin.png"))
+
+ggplot(pc_pre, aes(x = PC1, y = PC2)) + 
+        geom_point(aes(color = RACE_ETHNICITY), size = 2, alpha = 0.5) + 
+        labs(title = "Pre-processing PC2 vs PC1 (halfmin imputed)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, PARENT_SAMPLE_NAME, "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+
+ggsave(here(fig_dir, "PC1_PC2_preprocessing_by_race_halfmin.png"))
+```
+
+# 7. Log-transformation & pareto-scaling
+```{r}
+
+## log 10 transform all metabolites
+
+mets_all[, (mets_list_qc75) := log10(.SD + 1), .SDcols = mets_list_qc75]
+
+## Pareto-scale the features
+## Pareto-scaling = mean-centered and divided by the square root of standard deviation 
+
+# mets_all[, min(.SD), .SDcols = mets_list_qc75] #2.743995e-05
+# mets_all[, max(.SD), .SDcols = mets_list_qc75] #4.736254
+
+mets_all[, (mets_list_qc75) := lapply(.SD, pareto), .SDcols = mets_list_qc75]
+
+```
+
+# 8. Post-processing statistics & PCA
+## 8.1 Post-processing PCA (include xeno)
+The PC1 explained 12.9% variance and more than 25 PC can explain more than 50% variance
+```{r}
+mets_final_df <- as.data.frame(mets_all)
+rownames(mets_final_df) <- mets_final_df$PARENT_SAMPLE_NAME
+mets_final_df <- subset(mets_final_df, select = mets_list_qc75)
+
+pca_post <- prcomp(mets_final_df, scale. = T)
+
+fviz_eig(pca_post)
+
+pca_post$sdev[1]^2 / sum(pca_post$sdev^2) 
+which((cumsum(pca_post$sdev^2) / sum(pca_post$sdev^2)) > 0.5)[1] 
+
+pc_post <- pca_post$x %>% as.data.frame()
+
+ggplot(pc_post, aes(x = PC1, y = PC2)) + 
+        geom_point(size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing PC2 vs PC1 (halfmin imputed)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, rownames(pc_post), "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "PC1_PC2_postprocessing_halfmin.png"))
+
+ggpairs(pc_post[, 1:10], aes(alpha = 0.1)) + 
+        labs(title = "Post-processing PC1-10 pairwise plots (halfmin imputed)") + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "PC1_PC10_pairs_postprocessing_halfmin.png"), width = 15, height = 12)
+
+
+```
+## 8.2. Post-processing stats (include xeno)
+IQR information
+```{r}
+mets_post_stats <- cbind(apply(mets_all[, ..mets_list_qc75], 2, IQR), 
+                         apply(mets_all[, ..mets_list_qc75], 2, skewness))
+mets_post_stats <- as.data.frame(mets_post_stats) %>% rownames_to_column() %>% as.data.table()
+setnames(mets_post_stats, c("metabolite", "iqr_post", "skewness_post"))
+mets_post_stats[, ':='(iqr_rank_post = rank(iqr_post, ties.method = "first"), 
+                       skewness_rank_post = rank(skewness_post, ties.method = "first"))]
+
+mets_post_stats[, summary(iqr_post)]
+
+ggplot(mets_post_stats) + 
+        geom_point(aes(iqr_rank_post, iqr_post), size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing IQR (halfmin imputed)") +
+        labs(x = "Rank", y = "IQR") + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "iqr_postprocessing_halfmin.png"), width = 5, height = 5)
+```
+Skewness information
+498 out of 1497 Metabolites are skewed.
+```{r}
+mets_post_stats[, summary(skewness_post)]
+
+mets_post_stats[, .N, skewness_post>=2|skewness_post<=-2]
+
+
+ggplot(mets_post_stats) + 
+        geom_point(aes(skewness_rank_post, skewness_post), size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing skewness (halfmin imputed)") +
+        labs(x = "Rank", y = "Skewness") + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "skewness_postprocessing_halfmin.png"), width = 5, height = 5)
+
+```
+
+
+## 8.3 Post-processing PCA (exclude xeno)
+The PC1 explained 15.9% variance and more than 15 PC can explain more than 50% variance
+```{r}
+mets_final_df_exp_xeno <- as.data.frame(mets_all)
+rownames(mets_final_df_exp_xeno) <- mets_final_df_exp_xeno$PARENT_SAMPLE_NAME
+mets_final_df_exp_xeno <- subset(mets_final_df_exp_xeno, select = mets_list_exp_xeno_qc75)
+
+pca_post <- prcomp(mets_final_df_exp_xeno, scale. = T)
+
+fviz_eig(pca_post)
+
+pca_post$sdev[1]^2 / sum(pca_post$sdev^2) 
+which((cumsum(pca_post$sdev^2) / sum(pca_post$sdev^2)) > 0.5)[1] 
+
+pc_post <- pca_post$x %>% as.data.frame()
+
+ggplot(pc_post, aes(x = PC1, y = PC2)) + 
+        geom_point(size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing PC2 vs PC1 (halfmin imputed)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, rownames(pc_post), "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "PC1_PC2_postprocessing_halfmin_exp_xeno.png"))
+
+ggpairs(pc_post[, 1:10], aes(alpha = 0.1)) + 
+        labs(title = "Post-processing PC1-10 pairwise plots (halfmin imputed)") + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "PC1_PC10_pairs_postprocessing_halfmin_exp_xeno.png"), width = 15, height = 12)
+
+
+```
+## 8.4 Post-processing stats (exclude xeno)
+IQR information
+```{r}
+mets_post_stats <- cbind(apply(mets_all[, ..mets_list_exp_xeno_qc75], 2, IQR), 
+                         apply(mets_all[, ..mets_list_exp_xeno_qc75], 2, skewness))
+mets_post_stats <- as.data.frame(mets_post_stats) %>% rownames_to_column() %>% as.data.table()
+setnames(mets_post_stats, c("metabolite", "iqr_post", "skewness_post"))
+mets_post_stats[, ':='(iqr_rank_post = rank(iqr_post, ties.method = "first"), 
+                       skewness_rank_post = rank(skewness_post, ties.method = "first"))]
+
+mets_post_stats[, summary(iqr_post)]
+
+ggplot(mets_post_stats) + 
+        geom_point(aes(iqr_rank_post, iqr_post), size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing IQR (halfmin imputed)") +
+        labs(x = "Rank", y = "IQR") + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "iqr_postprocessing_halfmin_exp_xeno.png"), width = 5, height = 5)
+```
+Skewness information
+```{r}
+mets_post_stats[, summary(skewness_post)]
+
+mets_post_stats[, .N, skewness_post>=2|skewness_post<=-2]
+
+
+ggplot(mets_post_stats) + 
+        geom_point(aes(skewness_rank_post, skewness_post), size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing skewness (halfmin imputed)") +
+        labs(x = "Rank", y = "Skewness") + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+ggsave(here(fig_dir, "skewness_postprocessing_halfmin_exp_xeno.png"), width = 5, height = 5)
+
+```
+
+# 9. PC plots by sample characteristics
+PCA expect for Xenobiotics
+
+The PC1 explained 15.9% variance and more than 15 PCs can explain more than 50% variance
+```{r}
+# pca except xenobiotics
+mets_final_df_exp_xeno <- subset(mets_final_df, select = mets_list_exp_xeno_qc75)
+# mets_final_df_exp_xeno[1:10,1:10]
+
+pca_post_exp_xeno <- prcomp(mets_final_df_exp_xeno, scale. = T)
+
+fviz_eig(pca_post_exp_xeno)
+
+pca_post_exp_xeno$sdev[1]^2 / sum(pca_post_exp_xeno$sdev^2) 
+which((cumsum(pca_post_exp_xeno$sdev^2) / sum(pca_post_exp_xeno$sdev^2)) > 0.5)[1] 
+
+pc_post_exp_xeno <- pca_post_exp_xeno$x %>% as.data.frame()
+
+```
+
+```{r}
+pc_post <- cbind(pc_post, sam_info) 
+pc_post_exp_xeno <- cbind(pc_post_exp_xeno, sam_info)
+
+ggplot(pc_post, aes(x = PC1, y = PC2)) + 
+        geom_point(aes(color = GENDER), size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing PC2 vs PC1 (halfmin imputed)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, PARENT_SAMPLE_NAME, "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+
+ggsave(here(fig_dir, "PC1_PC2_postprocessing_by_gender_halfmin.png"))
+
+ggplot(pc_post_exp_xeno, aes(x = PC1, y = PC2)) + 
+        geom_point(aes(color = GENDER), size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing PC2 vs PC1 (halfmin imputed, except for Xenobiotics)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, PARENT_SAMPLE_NAME, "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+
+ggsave(here(fig_dir, "PC1_PC2_postprocessing_by_gender_halfmin_exp_xeno.png"))
+
+
+ggplot(pc_post, aes(x = PC1, y = PC2)) + 
+        geom_point(aes(color = AGE), size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing PC2 vs PC1 (halfmin imputed)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, PARENT_SAMPLE_NAME, "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+
+ggsave(here(fig_dir, "PC1_PC2_postprocessing_by_age_halfmin.png"))
+
+ggplot(pc_post_exp_xeno, aes(x = PC1, y = PC2)) + 
+        geom_point(aes(color = AGE), size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing PC2 vs PC1 (halfmin imputed, except for Xenobiotics)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, PARENT_SAMPLE_NAME, "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+
+ggsave(here(fig_dir, "PC1_PC2_postprocessing_by_age_halfmin_exp_xeno.png"))
+
+
+ggplot(pc_post, aes(x = PC1, y = PC2)) + 
+        geom_point(aes(color = RACE_ETHNICITY), size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing PC2 vs PC1 (halfmin imputed)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, PARENT_SAMPLE_NAME, "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+
+ggsave(here(fig_dir, "PC1_PC2_postprocessing_by_race_halfmin_exp_xeno.png"))
+
+ggplot(pc_post_exp_xeno, aes(x = PC1, y = PC2)) + 
+        geom_point(aes(color = RACE_ETHNICITY), size = 2, alpha = 0.5) + 
+        labs(title = "Post-processing PC2 vs PC1 (halfmin imputed, except for Xenobiotics)") + 
+        geom_label_repel(aes(label = ifelse(PC1 < -75 | PC2 > 75, PARENT_SAMPLE_NAME, "")),
+                  box.padding   = 0.25, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') + 
+        theme_minimal() + 
+        theme(plot.title = element_text(size = 12, face = "bold"), 
+              axis.text = element_text(size = 12), 
+              axis.title = element_text(size = 12))
+
+```
+
+# 10. Save data
+```{r}
+write.csv(mets_final_df, here(res_dir, "Mets_Global_QC_version2.csv"), row.names=T)
+
+save(mets_final_df, mets_final_df_exp_xeno, mets_list_qc75, mets_list_exp_xeno_qc75, mets_list, mets_na_75, mets_list_exp_xeno, xen_list, mets_info, mets_na, sam_info, 
+     file = here(res_dir, "processed_QC_version2.RData"))
+```
+
+# Session info
+```{r}
+sessionInfo()
+```
+
+
