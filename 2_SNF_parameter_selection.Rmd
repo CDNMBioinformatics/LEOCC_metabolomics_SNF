@@ -1,0 +1,396 @@
+---
+title: "COVID: SNF parameter selection"
+subtitle: "subjects with plasma before covid, mets except xenobiotics"
+author: "Yulu Chen"
+output: 
+  html_document: 
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+# 1. Setup
+## 1.1 Load packages
+```{r, include=FALSE}
+## Packages
+
+pkg <- c("data.table", "plyr", "igraph", "SNFtool", "ggpubr", "RColorBrewer", "lattice", "dplyr", "stringr", "qgraph", "ggalluvial", "tidyverse", "DT", "GGally", "here", "table1", "ggrepel", "openxlsx",
+         "MASS", "Hmisc")
+for (p in pkg) {
+        if (require(p, character.only = T)) {
+                print(paste0(p, " loaded successfully"))
+        } else {
+                install.packages(p)
+                require(p, character.only = T)
+                print(paste0(p, " downloaded and loaded successfully"))
+        }
+}
+
+```
+
+## 1.2 Functions
+```{r}
+# Diagonals for heatmap set to 0
+diag0 <- function(df){
+    df2 <-df
+    diag(df2) <- 0
+    return(df2)
+}
+
+```
+
+## 1.3 Set Paths
+```{r}
+dat_dir <- "data/"
+fig_dir <- "figures"
+res_dir <- "results"
+```
+
+## 1.4 Import Data
+Import metabolone data and phenotype data
+```{r}
+# load QC metabolomics data
+load("~/results/processed_QC_version2.RData",  verbose = T)
+
+# load meta data
+pheno <- read.xlsx("~/data/LEOCC_meta_data.xlsx", 1)
+
+pheno_disease <- fread("~/data/LEOCC_pheno_disease.csv")
+
+pheno_immune <- read.table(file = here(dat_dir, "pheno_immune.tsv"), sep = '\t', header = TRUE)
+
+pheno_flu <- fread("~/data/pheno_flu.csv")
+
+pheno_lab_test <- fread("~/data/pheno_lab_test.csv")
+
+```
+
+
+## 1.5 Select the Subject with Pre-covid Plasma Samples
+444 subjects with pre-covid plasma sample only
+475 subjects with pre-covid plasma sample
+```{r}
+subject_plasma_before_covid <- pheno[sample_term == "before COVID",]
+
+```
+
+## 1.6 Match Samples in Mets, Sam and Pheno Info
+```{r}
+
+# merge sam info and pheno
+subject_plasma_before_covid_id <- subject_plasma_before_covid$BiobankSubjectID
+
+any(duplicated(subject_plasma_before_covid_id)) #FALSE
+
+sam_df <- sam_info[sam_info$BiobankSubjectID %in% subject_plasma_before_covid_id,] #520
+any(duplicated(sam_df$BiobankSubjectID)) #TRUE
+any(is.na(sam_df$Confirmed_Date)) #FALSE
+
+sam_df <- merge(before_id, sam_df, by = "CLIENT_IDENTIFIER")
+any(is.na(sam_df$BiobankSubjectID.x))
+any(is.na(sam_df$BiobankSubjectID.y))
+sum(is.na(sam_df$BiobankSubjectID.y))
+
+sam_df_id <- sam_df[,c(1,2,4,20)]
+colnames(sam_df_id)[2] <- "BiobankSubjectID"
+
+mets <- mets_final_df %>% rownames_to_column()
+colnames(mets)[1] <- c("PARENT_SAMPLE_NAME")
+mets[1:10,1:10]
+
+mets <- merge(sam_df_id, mets, by = "PARENT_SAMPLE_NAME")
+# mets <- mets[mets$PARENT_SAMPLE_NAME %in% sam_df_id$PARENT_SAMPLE_NAME,]
+mets[1:10,1:10]
+mets <- mets[,-c(1,2,4)]
+
+dim(mets) # 474 1498
+mets[1:10,1:10]
+
+mets$BiobankSubjectID <- as.integer(mets$BiobankSubjectID)
+
+## Merge pheno and mets data
+df <- merge(subject_plasma_before_covid, mets, by = "BiobankSubjectID")
+dim(df)
+df[1:10,1:20]
+
+pheno_disease <- pheno_disease[,-c(2:6)]
+colnames(pheno_disease)[1] <- "BiobankSubjectID"
+df <- merge(df, pheno_disease, by = "BiobankSubjectID", all.x = T)
+
+pheno_flu <- pheno_flu[,-c(2:6)]
+colnames(pheno_flu)[1] <- "BiobankSubjectID"
+df <- merge(df, pheno_flu, by = "BiobankSubjectID", all.x = T)
+
+colnames(lab_test_df)[1] <- "BiobankSubjectID"
+df <- merge(df, lab_test_df, by = "BiobankSubjectID", all.x = T)
+```
+
+## 1.7 Basic statistic summary
+```{r}
+# race
+df$Race[df$Race == "Asian"] <- "Other"
+df$Race[df$Race == "Unknown"] <- "Other"
+df[, .N, Race][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# ethnicity
+df[, .N, Ethnicity][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# gender
+df[, .N, Gender][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# smoking status
+df$hasSmokingBeforeCovid <- as.character(as.integer(df$hasSmokingBeforeCovid))
+class(df$hasSmokingBeforeCovid)
+df[, .N, hasSmokingBeforeCovid][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# BMI
+ggplot(df, aes(x = BMI_med)) + geom_histogram() + labs(title = "BMI Median histogram")
+df[, summary(BMI_med)]
+df[, sd(BMI_med)]
+
+# plasma sample collection age
+df[, summary(Age)]
+df[, sd(Age)]
+
+# deceased
+df[, .N, Deceased][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+```
+
+## 1.8 Estimate residual of metabolites
+455 subjects were useed to further analysis
+
+model: Mets ~ Gender + Race + Ethnicity + Smoking + Age + BMI
+
+all platforms
+```{r}
+# QC mets for all mets
+df_res <- data.frame(cbind(df$BiobankSubjectID, df$BMI_med))
+colnames(df_res) <- c("BiobankSubjectID", "BMI_med")
+
+for (met in mets_list_qc75) {
+  fit <- eval(parse(text = str_c("glm(", met, " ~ Gender + Race + Ethnicity + hasSmokingBeforeCovid + Age + BMI_med, data = df)")))
+  df_res[,met] <- resid(fit, na.action=na.exclude)
+}
+
+dim(df_res)
+df_res[1:10,1:10]
+
+# QC mets except for xeno
+df_res_exp_xeno <- df_res[,c("BiobankSubjectID","BMI_med", mets_list_exp_xeno_qc75)]
+dim(df_res_exp_xeno)
+df_res_exp_xeno[1:10,1:10]
+
+```
+
+mets list
+```{r}
+# metabolomics list (missing percent less than 75%)
+mets_info_qc75 <- mets_info[mets_info$Name %in% mets_list_qc75, ]
+table(mets_info_qc75$PLATFORM)
+
+# metabolomics list except for xenobiotics (missing percent less than 75%)
+mets_info_qc75_exp_xeno <- mets_info[mets_info$Name %in% mets_list_exp_xeno_qc75, ]
+table(mets_info_qc75_exp_xeno$PLATFORM)
+```
+
+Neg platform
+```{r}
+# QC mets
+df_res_neg <- data.frame(cbind(df$BiobankSubjectID, df$BMI_med))
+colnames(df_res_neg) <- c("BiobankSubjectID", "BMI_med")
+df_res_neg <- df_res_neg[complete.cases(df_res_neg),]
+
+mets_list_qc75_neg <- mets_info_qc75$Name[mets_info_qc75$PLATFORM == "Neg"]
+for (met in mets_list_qc75_neg) {
+  fit <- eval(parse(text = str_c("glm(", met, " ~ Gender + Race + Ethnicity + hasSmokingBeforeCovid + Age + BMI_med, data = df)")))
+  df_res_neg[,met] <- resid(fit, na.action=na.exclude)
+}
+
+dim(df_res_neg)
+df_res_neg[1:10,1:10]
+
+# QC mets except for xeno
+mets_list_qc75_exp_xeno_neg <- mets_info_qc75_exp_xeno$Name[mets_info_qc75_exp_xeno$PLATFORM == "Neg"]
+df_res_exp_xeno_neg <- df_res_neg[,c("BiobankSubjectID","BMI_med", mets_list_qc75_exp_xeno_neg)]
+
+```
+
+Polar platform
+```{r}
+# QC mets
+df_res_polar <- data.frame(cbind(df$BiobankSubjectID, df$BMI_med))
+colnames(df_res_polar) <- c("BiobankSubjectID", "BMI_med")
+df_res_polar <- df_res_polar[complete.cases(df_res_polar),]
+
+mets_list_qc75_polar <- mets_info_qc75$Name[mets_info_qc75$PLATFORM == "Polar"]
+for (met in mets_list_qc75_polar) {
+  fit <- eval(parse(text = str_c("glm(", met, " ~ Gender + Race + Ethnicity + hasSmokingBeforeCovid + Age + BMI_med, data = df)")))
+  df_res_polar[,met] <- resid(fit, na.action=na.exclude)
+}
+
+dim(df_res_polar)
+df_res_polar[1:10,1:10]
+
+# QC mets except for xeno
+mets_list_qc75_exp_xeno_polar <- mets_info_qc75_exp_xeno$Name[mets_info_qc75_exp_xeno$PLATFORM == "Polar"]
+df_res_exp_xeno_polar <- df_res_polar[,c("BiobankSubjectID","BMI_med", mets_list_qc75_exp_xeno_polar)]
+
+```
+
+Pos Early platform
+```{r}
+# QC mets
+df_res_posearly <- data.frame(cbind(df$BiobankSubjectID, df$BMI_med))
+colnames(df_res_posearly) <- c("BiobankSubjectID", "BMI_med")
+df_res_posearly <- df_res_posearly[complete.cases(df_res_posearly),]
+
+mets_list_qc75_posearly <- mets_info_qc75$Name[mets_info_qc75$PLATFORM == "Pos Early"]
+for (met in mets_list_qc75_posearly) {
+  fit <- eval(parse(text = str_c("glm(", met, " ~ Gender + Race + Ethnicity + hasSmokingBeforeCovid + Age + BMI_med, data = df)")))
+  df_res_posearly[,met] <- resid(fit, na.action=na.exclude)
+}
+
+dim(df_res_posearly)
+df_res_posearly[1:10,1:10]
+
+# QC mets except for xeno
+mets_list_qc75_exp_xeno_posearly <- mets_info_qc75_exp_xeno$Name[mets_info_qc75_exp_xeno$PLATFORM == "Pos Early"]
+df_res_exp_xeno_posearly <- df_res_posearly[,c("BiobankSubjectID","BMI_med", mets_list_qc75_exp_xeno_posearly)]
+
+```
+
+
+Pos Late platform
+```{r}
+# QC mets
+df_res_poslate <- data.frame(cbind(df$BiobankSubjectID, df$BMI_med))
+colnames(df_res_poslate) <- c("BiobankSubjectID", "BMI_med")
+df_res_poslate <- df_res_poslate[complete.cases(df_res_poslate),]
+
+mets_list_qc75_poslate <- mets_info_qc75$Name[mets_info_qc75$PLATFORM == "Pos Late"]
+for (met in mets_list_qc75_poslate) {
+  fit <- eval(parse(text = str_c("glm(", met, " ~ Gender + Race + Ethnicity + hasSmokingBeforeCovid + Age + BMI_med, data = df)")))
+  df_res_poslate[,met] <- resid(fit, na.action=na.exclude)
+}
+
+dim(df_res_poslate)
+df_res_poslate[1:10,1:10]
+
+# QC mets except for xeno
+mets_list_qc75_exp_xeno_poslate <- mets_info_qc75_exp_xeno$Name[mets_info_qc75_exp_xeno$PLATFORM == "Pos Late"]
+df_res_exp_xeno_poslate <- df_res_poslate[,c("BiobankSubjectID","BMI_med", mets_list_qc75_exp_xeno_poslate)]
+
+
+```
+
+
+
+# 2. Similarity Network Fusion
+## 2.1 Calculate Distance Matrices
+computes the squared Euclidean distances between all pairs of data points
+```{r}
+# QC mets
+df_res_exp_xeno<- df_res_exp_xeno[,-c(1,2)]
+Dist <- (dist2(as.matrix(df_res_exp_xeno),as.matrix(df_res_exp_xeno)))^(1/2)
+dim(Dist)
+
+df_res_exp_xeno_neg<- df_res_exp_xeno_neg[,-c(1,2)]
+df_res_exp_xeno_polar<- df_res_exp_xeno_polar[,-c(1,2)]
+df_res_exp_xeno_posearly<- df_res_exp_xeno_posearly[,-c(1,2)]
+df_res_exp_xeno_poslate<- df_res_exp_xeno_poslate[,-c(1,2)]
+
+Dist_neg = (dist2(as.matrix(df_res_exp_xeno_neg),as.matrix(df_res_exp_xeno_neg)))^(1/2)
+Dist_polar = (dist2(as.matrix(df_res_exp_xeno_polar),as.matrix(df_res_exp_xeno_polar)))^(1/2)
+Dist_posearly = (dist2(as.matrix(df_res_exp_xeno_posearly),as.matrix(df_res_exp_xeno_posearly)))^(1/2)
+Dist_poslate = (dist2(as.matrix(df_res_exp_xeno_poslate),as.matrix(df_res_exp_xeno_poslate)))^(1/2)
+
+```
+
+
+## 2.2 Test tuning parameters, output 3 best combinations (optimize variance)
+```{r}
+## Only run this once -- takes a long time to run
+filtmetsEuclidDistList <- list(Dist_neg, Dist_polar, Dist_posearly, Dist_poslate)
+for(i in 1:4){
+    varResultsDf <- data.frame(KNN=integer(),alpha=numeric(),variance=numeric())
+    for(K in seq(20,150,1)){
+        for(alpha in seq(0.3,1,0.1)){
+            ## Draw similarity graphs
+            simGraph <- affinityMatrix(filtmetsEuclidDistList[[i]], K, alpha)
+            ## Calculate the variance of the upper triangle
+            upperTriVar <- var(simGraph[upper.tri(simGraph)])
+            ## Build results data frame
+            varResultsDf <- rbind(varResultsDf,
+                                  data.frame(KNN=K,alpha=alpha,
+                                             variance=upperTriVar))
+        }
+    }
+    ## Report results
+    topRes <- varResultsDf[order(-varResultsDf$variance),][1:3,]
+    print(topRes)
+    ## Show graphs for the top 3 highest variance combinations
+    for(j in 1:nrow(topRes)){
+      simGraph <- affinityMatrix(filtmetsEuclidDistList[[i]], K=topRes$KNN[j], sigma=topRes$alpha[j])
+      diag(simGraph) <- 0 # for plotting diag well
+      distNorm <- function(x){
+        x <- x/rowSums(x)
+        x <- x + t(x)
+        dist(x)
+      }
+      heatmap(x=simGraph,col=rev(colorRampPalette(brewer.pal(10, "RdBu"))(256)),
+              scale="none",distfun=distNorm,symm=TRUE,
+              hclust=function(x) hclust(x,method="complete"))
+    }
+}
+
+
+```
+
+
+## 2.3 Test tuning parameters when K is stable, output 3 best combinations (optimize variance)
+```{r}
+## Only run this once -- takes a long time to run
+filtmetsEuclidDistList <- list(Dist_neg, Dist_polar, Dist_posearly, Dist_poslate)
+for(i in 1:4){
+    varResultsDf <- data.frame(KNN=integer(),alpha=numeric(),variance=numeric())
+        for(alpha in seq(0.3,1,0.1)){
+            ## Draw similarity graphs
+            simGraph <- affinityMatrix(filtmetsEuclidDistList[[i]], 46, alpha)
+            ## Calculate the variance of the upper triangle
+            upperTriVar <- var(simGraph[upper.tri(simGraph)])
+            ## Build results data frame
+            varResultsDf <- rbind(varResultsDf,
+                                  data.frame(KNN=46,alpha=alpha,
+                                             variance=upperTriVar))
+        }
+
+    ## Report results
+    topRes <- varResultsDf[order(-varResultsDf$variance),][1:3,]
+    print(topRes)
+    ## Show graphs for the top 3 highest variance combinations
+    for(j in 1:nrow(topRes)){
+      simGraph <- affinityMatrix(filtmetsEuclidDistList[[i]], K=topRes$KNN[j], sigma=topRes$alpha[j])
+      diag(simGraph) <- 0 # for plotting diag well
+      distNorm <- function(x){
+        x <- x/rowSums(x)
+        x <- x + t(x)
+        dist(x)
+      }
+      heatmap(x=simGraph,col=rev(colorRampPalette(brewer.pal(10, "RdBu"))(256)),
+              scale="none",distfun=distNorm,symm=TRUE,
+              hclust=function(x) hclust(x,method="complete"))
+    }
+}
+
+
+```
+
+# 3. Session info
+```{r}
+sessionInfo()
+```

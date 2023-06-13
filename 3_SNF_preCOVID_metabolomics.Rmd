@@ -1,0 +1,1596 @@
+---
+title: "COVID: SNF for metabolone"
+subtitle: "subjects with plasma before covid, mets except xenobiotics"
+author: "Yulu Chen/Kevin Mendez"
+output: 
+  html_document: 
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+# 1. Setup
+
+## 1.1 Load packages
+```{r, include=FALSE}
+## Packages
+
+pkg <- c("data.table", "plyr", "igraph", "SNFtool", "ggpubr", "RColorBrewer", "lattice", "dplyr", "stringr", "qgraph", "ggalluvial", "tidyverse", "DT", "GGally", "here", "table1", "ggrepel", "openxlsx",
+         "MASS", "Hmisc")
+for (p in pkg) {
+        if (require(p, character.only = T)) {
+                print(paste0(p, " loaded successfully"))
+        } else {
+                install.packages(p)
+                require(p, character.only = T)
+                print(paste0(p, " downloaded and loaded successfully"))
+        }
+}
+
+```
+
+## 1.2 Functions
+```{r}
+# Diagonals for heatmap set to 0
+diag0 <- function(df){
+    df2 <-df
+    diag(df2) <- 0
+    return(df2)
+}
+
+```
+
+## 1.3 Set Paths
+```{r}
+dat_dir <- "data/"
+fig_dir <- "figures"
+res_dir <- "results"
+```
+
+## 1.4 Import Data
+Import metabolone data and phenotype data
+```{r}
+# load QC metabolomics data
+load("~/results/processed_QC_version2.RData",  verbose = T)
+
+# load meta data
+pheno <- read.xlsx("~/data/LEOCC_meta_data.xlsx", 1)
+
+pheno_disease <- fread("~/data/LEOCC_pheno_disease.csv")
+
+pheno_immune <- read.table(file = here(dat_dir, "pheno_immune.tsv"), sep = '\t', header = TRUE)
+
+pheno_flu <- fread("~/data/pheno_flu.csv")
+
+pheno_lab_test <- fread("~/data/pheno_lab_test.csv")
+
+```
+
+
+## 1.5 Select the Subject with Pre-covid Plasma Samples
+444 subjects with pre-covid plasma sample only
+475 subjects with pre-covid plasma sample
+```{r}
+subject_plasma_before_covid <- pheno[sample_term == "before COVID",]
+
+```
+
+## 1.6 Match Samples in Mets, Sam and Pheno Info
+```{r}
+
+# merge sam info and pheno
+subject_plasma_before_covid_id <- subject_plasma_before_covid$BiobankSubjectID
+
+any(duplicated(subject_plasma_before_covid_id)) #FALSE
+
+sam_df <- sam_info[sam_info$BiobankSubjectID %in% subject_plasma_before_covid_id,] #520
+any(duplicated(sam_df$BiobankSubjectID)) #TRUE
+any(is.na(sam_df$Confirmed_Date)) #FALSE
+
+sam_df <- merge(before_id, sam_df, by = "CLIENT_IDENTIFIER")
+any(is.na(sam_df$BiobankSubjectID.x))
+any(is.na(sam_df$BiobankSubjectID.y))
+sum(is.na(sam_df$BiobankSubjectID.y))
+
+sam_df_id <- sam_df[,c(1,2,4,20)]
+colnames(sam_df_id)[2] <- "BiobankSubjectID"
+
+mets <- mets_final_df %>% rownames_to_column()
+colnames(mets)[1] <- c("PARENT_SAMPLE_NAME")
+mets[1:10,1:10]
+
+mets <- merge(sam_df_id, mets, by = "PARENT_SAMPLE_NAME")
+# mets <- mets[mets$PARENT_SAMPLE_NAME %in% sam_df_id$PARENT_SAMPLE_NAME,]
+mets[1:10,1:10]
+mets <- mets[,-c(1,2,4)]
+
+dim(mets) # 474 1498
+mets[1:10,1:10]
+
+mets$BiobankSubjectID <- as.integer(mets$BiobankSubjectID)
+
+## Merge pheno and mets data
+df <- merge(subject_plasma_before_covid, mets, by = "BiobankSubjectID")
+dim(df)
+df[1:10,1:20]
+
+pheno_disease <- pheno_disease[,-c(2:6)]
+colnames(pheno_disease)[1] <- "BiobankSubjectID"
+df <- merge(df, pheno_disease, by = "BiobankSubjectID", all.x = T)
+
+pheno_flu <- pheno_flu[,-c(2:6)]
+colnames(pheno_flu)[1] <- "BiobankSubjectID"
+df <- merge(df, pheno_flu, by = "BiobankSubjectID", all.x = T)
+
+colnames(lab_test_df)[1] <- "BiobankSubjectID"
+df <- merge(df, lab_test_df, by = "BiobankSubjectID", all.x = T)
+```
+
+## 1.7 Basic statistic summary
+```{r}
+# race
+df$Race[df$Race == "Asian"] <- "Other"
+df$Race[df$Race == "Unknown"] <- "Other"
+df[, .N, Race][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# ethnicity
+df[, .N, Ethnicity][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# gender
+df[, .N, Gender][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# smoking status
+df$hasSmokingBeforeCovid <- as.character(as.integer(df$hasSmokingBeforeCovid))
+class(df$hasSmokingBeforeCovid)
+df[, .N, hasSmokingBeforeCovid][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# BMI
+ggplot(df, aes(x = BMI_med)) + geom_histogram() + labs(title = "BMI Median histogram")
+df[, summary(BMI_med)]
+df[, sd(BMI_med)]
+
+# plasma sample collection age
+df[, summary(Age)]
+df[, sd(Age)]
+
+# deceased
+df[, .N, Deceased][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+```
+
+## 1.8 Estimate residual of metabolites
+455 subjects were useed to further analysis
+
+model: Mets ~ Gender + Race + Ethnicity + Smoking + Age + BMI
+
+all platforms
+```{r}
+# QC mets for all mets
+df_res <- data.frame(cbind(df$BiobankSubjectID, df$BMI_med))
+colnames(df_res) <- c("BiobankSubjectID", "BMI_med")
+
+for (met in mets_list_qc75) {
+  fit <- eval(parse(text = str_c("glm(", met, " ~ Gender + Race + Ethnicity + hasSmokingBeforeCovid + Age + BMI_med, data = df)")))
+  df_res[,met] <- resid(fit, na.action=na.exclude)
+}
+
+dim(df_res)
+df_res[1:10,1:10]
+
+# QC mets except for xeno
+df_res_exp_xeno <- df_res[,c("BiobankSubjectID","BMI_med", mets_list_exp_xeno_qc75)]
+dim(df_res_exp_xeno)
+df_res_exp_xeno[1:10,1:10]
+
+```
+
+mets list
+```{r}
+# metabolomics list (missing percent less than 75%)
+mets_info_qc75 <- mets_info[mets_info$Name %in% mets_list_qc75, ]
+table(mets_info_qc75$PLATFORM)
+
+# metabolomics list except for xenobiotics (missing percent less than 75%)
+mets_info_qc75_exp_xeno <- mets_info[mets_info$Name %in% mets_list_exp_xeno_qc75, ]
+table(mets_info_qc75_exp_xeno$PLATFORM)
+```
+
+Neg platform
+```{r}
+# QC mets
+df_res_neg <- data.frame(cbind(df$BiobankSubjectID, df$BMI_med))
+colnames(df_res_neg) <- c("BiobankSubjectID", "BMI_med")
+df_res_neg <- df_res_neg[complete.cases(df_res_neg),]
+
+mets_list_qc75_neg <- mets_info_qc75$Name[mets_info_qc75$PLATFORM == "Neg"]
+for (met in mets_list_qc75_neg) {
+  fit <- eval(parse(text = str_c("glm(", met, " ~ Gender + Race + Ethnicity + hasSmokingBeforeCovid + Age + BMI_med, data = df)")))
+  df_res_neg[,met] <- resid(fit, na.action=na.exclude)
+}
+
+dim(df_res_neg)
+df_res_neg[1:10,1:10]
+
+# QC mets except for xeno
+mets_list_qc75_exp_xeno_neg <- mets_info_qc75_exp_xeno$Name[mets_info_qc75_exp_xeno$PLATFORM == "Neg"]
+df_res_exp_xeno_neg <- df_res_neg[,c("BiobankSubjectID","BMI_med", mets_list_qc75_exp_xeno_neg)]
+
+```
+
+Polar platform
+```{r}
+# QC mets
+df_res_polar <- data.frame(cbind(df$BiobankSubjectID, df$BMI_med))
+colnames(df_res_polar) <- c("BiobankSubjectID", "BMI_med")
+df_res_polar <- df_res_polar[complete.cases(df_res_polar),]
+
+mets_list_qc75_polar <- mets_info_qc75$Name[mets_info_qc75$PLATFORM == "Polar"]
+for (met in mets_list_qc75_polar) {
+  fit <- eval(parse(text = str_c("glm(", met, " ~ Gender + Race + Ethnicity + hasSmokingBeforeCovid + Age + BMI_med, data = df)")))
+  df_res_polar[,met] <- resid(fit, na.action=na.exclude)
+}
+
+dim(df_res_polar)
+df_res_polar[1:10,1:10]
+
+# QC mets except for xeno
+mets_list_qc75_exp_xeno_polar <- mets_info_qc75_exp_xeno$Name[mets_info_qc75_exp_xeno$PLATFORM == "Polar"]
+df_res_exp_xeno_polar <- df_res_polar[,c("BiobankSubjectID","BMI_med", mets_list_qc75_exp_xeno_polar)]
+
+```
+
+Pos Early platform
+```{r}
+# QC mets
+df_res_posearly <- data.frame(cbind(df$BiobankSubjectID, df$BMI_med))
+colnames(df_res_posearly) <- c("BiobankSubjectID", "BMI_med")
+df_res_posearly <- df_res_posearly[complete.cases(df_res_posearly),]
+
+mets_list_qc75_posearly <- mets_info_qc75$Name[mets_info_qc75$PLATFORM == "Pos Early"]
+for (met in mets_list_qc75_posearly) {
+  fit <- eval(parse(text = str_c("glm(", met, " ~ Gender + Race + Ethnicity + hasSmokingBeforeCovid + Age + BMI_med, data = df)")))
+  df_res_posearly[,met] <- resid(fit, na.action=na.exclude)
+}
+
+dim(df_res_posearly)
+df_res_posearly[1:10,1:10]
+
+# QC mets except for xeno
+mets_list_qc75_exp_xeno_posearly <- mets_info_qc75_exp_xeno$Name[mets_info_qc75_exp_xeno$PLATFORM == "Pos Early"]
+df_res_exp_xeno_posearly <- df_res_posearly[,c("BiobankSubjectID","BMI_med", mets_list_qc75_exp_xeno_posearly)]
+
+```
+
+
+Pos Late platform
+```{r}
+# QC mets
+df_res_poslate <- data.frame(cbind(df$BiobankSubjectID, df$BMI_med))
+colnames(df_res_poslate) <- c("BiobankSubjectID", "BMI_med")
+df_res_poslate <- df_res_poslate[complete.cases(df_res_poslate),]
+
+mets_list_qc75_poslate <- mets_info_qc75$Name[mets_info_qc75$PLATFORM == "Pos Late"]
+for (met in mets_list_qc75_poslate) {
+  fit <- eval(parse(text = str_c("glm(", met, " ~ Gender + Race + Ethnicity + hasSmokingBeforeCovid + Age + BMI_med, data = df)")))
+  df_res_poslate[,met] <- resid(fit, na.action=na.exclude)
+}
+
+dim(df_res_poslate)
+df_res_poslate[1:10,1:10]
+
+# QC mets except for xeno
+mets_list_qc75_exp_xeno_poslate <- mets_info_qc75_exp_xeno$Name[mets_info_qc75_exp_xeno$PLATFORM == "Pos Late"]
+df_res_exp_xeno_poslate <- df_res_poslate[,c("BiobankSubjectID","BMI_med", mets_list_qc75_exp_xeno_poslate)]
+
+
+```
+
+
+# 2. Similarity Network Fusion
+## 2.1 Set Hyperparameters
+
+```{r}
+set.seed(42)
+
+#K <- 231 # K = N/10 = 953/10 = 95
+# K <- round(nrow(df_res) / 6)
+
+K <- round(nrow(df_res) / 10)
+
+# K = 30
+
+alpha <- 0.8 # alpha between 0.3 and 0.8
+Inter <- 20
+```
+
+## 2.2 Calculate Distance Matrices
+computes the squared Euclidean distances between all pairs of data points
+```{r}
+# QC mets
+df_res_exp_xeno<- df_res_exp_xeno[,-c(1,2)]
+Dist <- (dist2(as.matrix(df_res_exp_xeno),as.matrix(df_res_exp_xeno)))^(1/2)
+dim(Dist)
+
+df_res_exp_xeno_neg<- df_res_exp_xeno_neg[,-c(1,2)]
+df_res_exp_xeno_polar<- df_res_exp_xeno_polar[,-c(1,2)]
+df_res_exp_xeno_posearly<- df_res_exp_xeno_posearly[,-c(1,2)]
+df_res_exp_xeno_poslate<- df_res_exp_xeno_poslate[,-c(1,2)]
+
+Dist_neg = (dist2(as.matrix(df_res_exp_xeno_neg),as.matrix(df_res_exp_xeno_neg)))^(1/2)
+Dist_polar = (dist2(as.matrix(df_res_exp_xeno_polar),as.matrix(df_res_exp_xeno_polar)))^(1/2)
+Dist_posearly = (dist2(as.matrix(df_res_exp_xeno_posearly),as.matrix(df_res_exp_xeno_posearly)))^(1/2)
+Dist_poslate = (dist2(as.matrix(df_res_exp_xeno_poslate),as.matrix(df_res_exp_xeno_poslate)))^(1/2)
+
+save(df_res_exp_xeno, df_res_exp_xeno_neg, df_res_exp_xeno_polar, df_res_exp_xeno_posearly, df_res_exp_xeno_poslate,
+     file = here(res_dir, "df_res_exp_xeno_training.RData"))
+```
+
+
+## 2.3 Create Affinity Matrices
+Convert distance matrices to similarity matricies
+```{r}
+W <- affinityMatrix(Dist, K, alpha)
+displayClustersWithHeatmap(W, spectralClustering(W, K = 3))
+
+W_neg = affinityMatrix(Dist_neg, K, alpha)
+W_polar = affinityMatrix(Dist_polar, K, alpha)
+W_posearly = affinityMatrix(Dist_posearly, K, alpha)
+W_poslate = affinityMatrix(Dist_poslate, K, alpha)
+
+```
+
+## 2.4 Fuse matrices using SNF
+
+```{r}
+
+W = SNF(list(W_neg, W_polar, W_posearly, W_poslate), K, Inter)
+displayClustersWithHeatmap(W, spectralClustering(W, K = 3))
+
+```
+
+## 2.5 Select number of clusters
+
+### 2.5.1 SNF
+
+```{r}
+estimationResult = estimateNumberOfClustersGivenGraph(W, 2:10);
+estimationResult
+```
+
+### 2.5.1 Platform
+
+Neg platform -- 3
+```{r}
+estimationResult = estimateNumberOfClustersGivenGraph(W_neg, 2:10);
+estimationResult
+```
+
+Polar platform -- 2
+```{r}
+estimationResult = estimateNumberOfClustersGivenGraph(W_polar, 2:10);
+estimationResult
+```
+
+Pos early platform -- 2
+```{r}
+estimationResult = estimateNumberOfClustersGivenGraph(W_posearly, 2:10);
+estimationResult
+```
+
+Pos late platform -- 4
+```{r}
+estimationResult = estimateNumberOfClustersGivenGraph(W_poslate, 2:10);
+estimationResult
+```
+
+## 2.6 Create clusters
+### 2.6.1 SNF
+
+```{r}
+C <- 3
+group = as.factor(spectralClustering(W,C))
+group <- gsub("1", "Cluster 1", group)
+group <- gsub("2", "Cluster 2", group)
+group <- gsub("3", "Cluster 3", group)
+
+length(group)
+table(group)
+
+# save the results
+df_group <- df
+df_group <- data.table(df_group, group)
+df_group$group_2 <- with(df_group, ifelse(group == "Cluster 3", 1, 0))
+table(df_group$group_2)
+write.csv(df_group, "results/1_3/metabo_endotype_before_covid_wiBMI_exp_xeno_df_group.csv")
+
+
+df_res_group <- df_res
+df_res_group <- data.table(df_res_group, group)
+write.csv(df_res_group, "results/1_3/metabo_endotype_before_covid_wiBMI_exp_xeno_df_res_group.csv")
+```
+
+### 2.6.2 Platform
+
+```{r}
+C <- 3
+group_neg = as.factor(spectralClustering(W_neg,C))
+
+table(group_neg)
+```
+
+```{r}
+C <- 2
+group_polar = as.factor(spectralClustering(W_polar,C))
+
+table(group_polar)
+```
+
+```{r}
+C <- 2
+group_posearly = as.factor(spectralClustering(W_posearly,C))
+
+table(group_posearly)
+```
+
+```{r}
+C <- 4
+group_poslate = as.factor(spectralClustering(W_poslate,C))
+
+table(group_poslate)
+```
+
+## 2.7 Leave one out cross cross-validation
+```{r}
+
+# Create an empty list to store the cross-validated results
+cv_results <- list()
+
+# Perform leave-one-out cross-validation
+start_time <- Sys.time()
+for (i in 1:455) {
+  # Remove the i-th sample from the data matrix for each platform
+  data_loo_neg <- df_res_exp_xeno_neg[-i, ]
+  data_loo_polar <- df_res_exp_xeno_polar[-i, ]
+  data_loo_posearly <- df_res_exp_xeno_posearly[-i, ]
+  data_loo_poslate <- df_res_exp_xeno_poslate[-i, ]
+  
+  # generate the generic distance matrix for each platform
+  Dist_loo_neg = (dist2(as.matrix(data_loo_neg),as.matrix(data_loo_neg)))^(1/2)
+  Dist_loo_polar = (dist2(as.matrix(data_loo_polar),as.matrix(data_loo_polar)))^(1/2)
+  Dist_loo_posearly = (dist2(as.matrix(data_loo_posearly),as.matrix(data_loo_posearly)))^(1/2)
+  Dist_loo_poslate = (dist2(as.matrix(data_loo_poslate),as.matrix(data_loo_poslate)))^(1/2)
+  
+  # Computes affinity matrix from a generic distance matrix
+  W_loo_neg = affinityMatrix(Dist_loo_neg, K, alpha)
+  W_loo_polar = affinityMatrix(Dist_loo_polar, K, alpha)
+  W_loo_posearly = affinityMatrix(Dist_loo_posearly, K, alpha)
+  W_loo_poslate = affinityMatrix(Dist_loo_poslate, K, alpha)
+  
+  # Perform SNF clustering on the remaining data
+  W_loo = SNF(list(W_loo_neg, W_loo_polar, W_loo_posearly, W_loo_poslate), K, Inter)
+
+  # Assign the clusters
+  group_loo = as.factor(spectralClustering(W_loo,C))
+  group_loo = data.table(df[-i, BiobankSubjectID], group_loo)
+  colnames(group_loo) <- c("BiobankSubjectID", i)
+
+  # Store the predicted cluster for the i-th sample
+  cv_results[[i]] <- group_loo
+}
+end_time <- Sys.time()
+elapsed_time <- end_time - start_time
+print(elapsed_time)
+
+# for (i in 1:455) {
+#   colnames(cv_results[[i]]) <- c("BiobankSubjectID", i)
+# }
+
+cv_results_df <- Reduce(function(df1, df2) merge(df1, df2, by = "BiobankSubjectID", all=T), cv_results) %>% as.data.frame()
+
+cv_results_data <- cv_results_df
+cv_results_data$group <- group
+
+# only focus on severe group
+cv_results_data$group <- with(cv_results_data, ifelse(group == "2", "1", "0"))
+
+for (i in 2:456) {
+  value_counts <- table(cv_results_data[,i])
+  min_index <- which.min(value_counts)
+  min_value <- names(value_counts)[min_index]
+  
+  cv_results_data[,i] <- with(cv_results_data, ifelse(cv_results_data[,i] == min_value, "1", "0"))
+}
+
+# Calculate accuracy for each prediction
+cv_results_data$accuracy <- NA
+
+for (i in 1:nrow(cv_results_data)) {
+  cv_results_data[i, "accuracy"] <- sum(as.character(cv_results_data[i,2:456]) ==    as.character(cv_results_data[i, "group"]), na.rm = T)/454
+}
+
+hist(cv_results_data$accuracy)
+mean(cv_results_data$accuracy)
+
+# hist(cv_results_df[group == "1", "accuracy"])
+# hist(cv_results_df[group == "2", "accuracy"])
+# hist(cv_results_df[group == "3", "accuracy"])
+
+save(cv_results, cv_results_df, cv_results_data,
+     file = here(res_dir, "cv_loocv_results.RData"))
+```
+
+
+
+# 3. Cluster association with clinical outcomes
+```{r}
+
+df_group$hasSmokingBeforeCovid <- factor(df_group$hasSmokingBeforeCovid,
+                                         levels = c(0,1),
+                                         labels = c("No", "Yes"))
+
+df_group$Deceased_f <- factor(df_group$Deceased,
+                                         levels = c(0,1),
+                                         labels = c("Not deceased", "Deceased"))
+
+# a <- as.data.frame(summary(aov(Age ~ group, data = df_group))[[1]])[1,5]
+pvalue <- function(x, ...) {
+    # Construct vectors of data y, and groups (strata) g
+    y <- unlist(x)
+    g <- factor(rep(1:length(x), times=sapply(x, length)))
+    if (is.numeric(y)) {
+        # For numeric variables, perform a standard 2-sample t-test
+        p <- as.data.frame(summary(aov(y ~ g))[[1]])[1,5]
+    } else {
+        # For categorical variables, perform a chi-squared test of independence
+        p <- chisq.test(table(y, g))$p.value
+    }
+    # Format the p-value, using an HTML entity for the less-than sign.
+    # The initial empty string places the output on the line below the variable label.
+    c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+
+table1(~ Gender + Age + BMI_med + Race + Ethnicity + hasSmokingBeforeCovid +
+       Deceased_f + BUN_med_pre2020 + creatinine_med_pre2020 + CRP_med_pre2020 + DBILI_med_pre2020 + TBILI_med_pre2020 + eos_count_med_pre2020 + neut_count_med_pre2020 + Ferritin_med_pre2020 + HDL_med_pre2020 + LDL_med_pre2020 + Lactate_med_pre2020 + LDH_med_pre2020 + Total_Cholesterol_med_pre2020 + VitD_25OH_med_pre2020| group, data = df_group, overall = F,
+       extra.col=list(`P-value`=pvalue))
+
+```
+
+## 3.1 Gender
+
+```{r}
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = df_group$Gender)
+res.chisq 
+
+# Count
+df_group[, .N, .(group, Gender)][order(group, Gender)]%>% group_by(group) %>% mutate(percent = prop.table(N)) %>% print(digits = 3)
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+  geom_bar(aes(fill=Gender),  position="dodge")
+
+```
+
+## 3.2 Age
+
+```{r}
+# Anova
+res.aov <- aov(Age ~ group, data = df_group)
+summary(res.aov)
+
+# Count
+aggregate(Age ~ group, df_group, mean)
+aggregate(Age ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = Age, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Age boxplot for different groups")
+
+```
+
+## 3.2 BMI
+```{r}
+# Anova
+res.aov <- aov(BMI_med ~ group, data = df_group)
+summary(res.aov)
+
+# Count
+aggregate(BMI_med ~ group, df_group, mean)
+aggregate(BMI_med ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = BMI_med, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "BMI_med boxplot for different groups")
+
+```
+
+## 3.3 Race
+```{r}
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = df_group$Race)
+res.chisq 
+
+# Count
+df_group[, .N, .(group, Race)][order(group, Race)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, Race)][order(group, Race)]%>% group_by(group) %>% mutate(percent = prop.table(N)) %>% print(digits = 3)
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+  geom_bar(aes(fill=Race),  position="dodge") 
+```
+
+## 3.4 Ethnicity
+```{r}
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = df_group$Ethnicity)
+res.chisq 
+
+# Count
+df_group[, .N, .(group, Ethnicity)][order(group, Ethnicity)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, Ethnicity)][order(group, Ethnicity)]%>% group_by(group) %>% mutate(percent = prop.table(N)) %>% print(digits = 3)
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+  geom_bar(aes(fill=Ethnicity),  position="dodge") 
+```
+
+## 3.5 Deceased 
+```{r}
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = as.character(df_group$Deceased))
+res.chisq 
+
+# logistic regression
+fit <- glm(Deceased ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+# Count
+df_group[, .N, .(group, Deceased)][order(group, Deceased)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, Deceased)][order(group, Deceased)]%>% group_by(group) %>% mutate(percent = prop.table(N)) %>% print(digits = 3)
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+  geom_bar(aes(fill=as.character(Deceased)),  position="dodge")  +
+  labs(fill = "Deceased")
+
+ggplot(data=df_group, aes(group))+
+  geom_bar(aes(fill=as.factor(Deceased)), position="fill") +
+  theme(axis.text=element_text(size=16),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  labs(fill='default')
+
+ggsave("deceased_pct.tiff", path = fig_dir, width = 8, height = 6, device='tiff', dpi=500)
+
+# death summary
+df_group_death <- df_group[Deceased == "Deceased",]
+dim(df_group_death)
+summary(df_group_death$Age)
+ggplot(df_group_death, aes(x = group, y = Age, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Age boxplot for different groups (Deceased)")
+
+
+# logistic cluster 3 vs other
+fit <- glm(Deceased ~ group_2 + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+```
+
+
+## 3.6 Smoking
+```{r}
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = as.character(df_group$hasSmokingBeforeCovid))
+res.chisq 
+
+# Count
+df_group[, .N, .(hasSmokingBeforeCovid)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, hasSmokingBeforeCovid)][order(group, hasSmokingBeforeCovid)]%>% group_by(group) %>% mutate(percent = prop.table(N)) %>% print(digits = 3)
+
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+  geom_bar(aes(fill=as.character(hasSmokingBeforeCovid)),  position="dodge") +
+  labs(fill = "Smoking")
+```
+
+## 3.7 Type 2 Diabetes Mellitus
+```{r}
+
+df_group[, .N, `T2DM - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, `T2DM - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`)][order(group, `T2DM - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, `T2DM - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`)][order(group, `T2DM - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`)]%>% group_by(group) %>% mutate(percent = prop.table(N)) %>% print(digits = 3)
+
+
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = df_group$`T2DM - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`)
+res.chisq 
+
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+  geom_bar(aes(fill=df_group$`T2DM - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`),  position="dodge") +
+  labs(fill = "T2D")
+
+# logistic cluster 3 vs other
+df_group$T2DM_n <- with(df_group, ifelse(`T2DM - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]` == "Yes", 1, 0))
+fit <- glm(T2DM_n ~ group_2 + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+
+# logistic 
+fit <- glm(T2DM_n ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+```
+
+
+## 3.8 Asthma -- Biobank
+```{r}
+
+df_group[, .N, `Asthma - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, `Asthma - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`)][order(group, `Asthma - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, `Asthma - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`)][order(group, `Asthma - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`)]%>% group_by(group) %>% mutate(percent = prop.table(N)) %>% print(digits = 3)
+
+
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = df_group$`Asthma - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`)
+res.chisq 
+
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+  geom_bar(aes(fill=df_group$`Asthma - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]`),  position="dodge") +
+  labs(fill = "Asthma")
+
+# logistic cluster 3 vs other
+df_group$asthma_n <- with(df_group, ifelse(`Asthma - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]` == "Yes", 1, 0))
+fit <- glm(asthma_n ~ group_2 + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+
+# logistic 
+fit <- glm(asthma_n ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+```
+
+
+## 3.9 COPD 
+```{r}
+
+df_group[, .N, `COPD - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]`][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, `COPD - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]`)][order(group, `COPD - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]`)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, `COPD - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]`)][order(group, `COPD - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]`)]%>% group_by(group) %>% mutate(percent = prop.table(N)) %>% print(digits = 3)
+
+
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = df_group$`COPD - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]`)
+res.chisq 
+
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+  geom_bar(aes(fill=df_group$`COPD - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]`),  position="dodge") +
+  labs(fill = "COPD")
+
+# logistic cluster 3 vs other
+df_group$COPD_n <- with(df_group, ifelse(`COPD - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]` == "Yes", 1, 0))
+fit <- glm(COPD_n ~ group_2 + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+# logistic 
+fit <- glm(COPD_n ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+```
+
+## 3.10 Hypertension
+```{r}
+
+df_group[, .N, `Hypertension - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]`][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, `Hypertension - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]`)][order(group, `Hypertension - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]`)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, `Hypertension - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]`)][order(group, `Hypertension - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]`)]%>% group_by(group) %>% mutate(percent = prop.table(N)) %>% print(digits = 3)
+
+
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = df_group$`Hypertension - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]`)
+res.chisq 
+
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+  geom_bar(aes(fill=df_group$`Hypertension - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]`),  position="dodge") +
+  labs(fill = "COPD")
+
+# logistic cluster 3 vs other
+df_group$hypertension_n <- with(df_group, ifelse(`Hypertension - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]` == "Yes", 1, 0))
+fit <- glm(hypertension_n ~ group_2 + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+# logistic 
+fit <- glm(hypertension_n ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+```
+
+## 3.11 Flu
+```{r}
+### flu existence
+which(is.na(df_group$`Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]`))  #439
+df_group_sub <- df_group[-439,]
+
+df_group_sub[, .N, `Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]`][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group_sub[, .N, .(group, `Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]`)][order(group, `Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]`)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group_sub[, .N, .(group, `Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]`)][order(group, `Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]`)]%>% group_by(group) %>% mutate(percent = prop.table(N)) %>% print(digits = 3)
+
+
+# Chi-squared
+res.chisq <- chisq.test(x = df_group_sub$group, y = df_group_sub$`Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]`)
+res.chisq 
+
+# logistic 
+df_group_sub$influenza_exist <- df_group_sub$`Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]`
+df_group_sub$influenza_exist <- with(df_group_sub, ifelse(influenza_exist == "Yes", 1, 0))
+table(df_group_sub$influenza_exist)
+fit <- glm(influenza_exist ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group_sub, family = 'binomial')
+summary(fit)
+
+
+# Plot
+ggplot(df_group_sub, aes(x = group)) +
+  geom_bar(aes(fill=df_group_sub$`Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]`),  position="dodge") +
+  labs(fill = "flu")
+
+ggplot(data=df_group_sub, aes(group))+
+  geom_bar(aes(fill=as.factor(`Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]`)), position="fill") +
+  theme(axis.text=element_text(size=16),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  labs(fill='default')
+
+ggsave("flu_pct.tiff", path = fig_dir, width = 8, height = 6, device='tiff', dpi=500)
+
+
+# logistic cluster 3 vs other
+df_group$flu_n <- with(df_group, ifelse(`Influenza [Existence (Yes/No)][01/01/2010 to 4/15/2022]` == "Yes", "1", "0"))
+fit <- glm(flu_n ~ group_2 + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+### flu count
+# Anova
+res.aov <- aov(`Influenza [Count][01/01/2010 to 4/15/2022]` ~ group, data = df_group_sub)
+summary(res.aov)
+
+
+# linear regression 
+fit <- lm(`Influenza [Count][01/01/2010 to 4/15/2022]` ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+
+# Count
+aggregate(`Influenza [Count][01/01/2010 to 4/15/2022]` ~ group, df_group_sub, mean)
+aggregate(`Influenza [Count][01/01/2010 to 4/15/2022]` ~ group, df_group_sub, sd)
+
+# Boxplot
+ggplot(df_group_sub, aes(x = group, y = `Influenza [Count][01/01/2010 to 4/15/2022]`, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "flu count boxplot for different clusters") + ylab("flu count") + 
+    theme(axis.text=element_text(size=16),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  labs(fill='default')
+
+ggsave("flu_count.tiff", path = fig_dir, width = 8, height = 6, device='tiff', dpi=500)
+
+
+ggplot(df_group_sub, aes(x = group, y = `Influenza [Count][01/01/2010 to 4/15/2022]`, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_violin(alpha = 0.5) +
+        labs(title = "flu count for different clusters") + ylab("lu count")
+
+# linear regression cluster 3 vs other
+fit <- lm(`Influenza [Count][01/01/2010 to 4/15/2022]` ~ group_2 + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+```
+
+## 3.12 VitD
+```{r}
+# Anova
+res.aov <- aov(VitD_med ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(VitD_med ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+
+# Count
+aggregate(VitD_med ~ group, df_group, mean)
+aggregate(VitD_med ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = VitD_med, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Vitamin D (median) boxplot for different groups")
+
+```
+
+
+## 3.13 Blood Urea Nitrogen
+```{r}
+# Anova
+res.aov <- aov(BUN_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(BUN_med_pre2020 ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+
+# Count
+aggregate(BUN_med_pre2020 ~ group, df_group, mean)
+aggregate(BUN_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = BUN_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Blood Urea Nitrogen (median) boxplot for different groups")
+
+```
+
+
+## 3.14 Creatinine
+```{r}
+# Anova
+res.aov <- aov(creatinine_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(creatinine_med_pre2020 ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+# Count
+aggregate(creatinine_med_pre2020 ~ group, df_group, mean)
+aggregate(creatinine_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = creatinine_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Plasma Creatinine (median) boxplot for different groups")
+
+```
+
+
+## 3.15 Bilirubin
+```{r}
+# Anova
+res.aov <- aov(TBILI_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(TBILI_med_pre2020~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+# Count
+aggregate(TBILI_med_pre2020 ~ group, df_group, mean)
+aggregate(TBILI_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = TBILI_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Bilirubin (median) boxplot for different groups")
+
+```
+
+## 3.16 Eosinophils
+```{r}
+# Anova
+res.aov <- aov(eos_count_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(eos_count_med_pre2020 ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+# Count
+aggregate(eos_count_med_pre2020 ~ group, df_group, mean)
+aggregate(eos_count_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = eos_count_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Eosinophils (median) boxplot for different groups")
+
+```
+
+
+## 3.17 Neutrophils
+```{r}
+# Anova
+res.aov <- aov(neut_count_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(neut_count_med_pre2020 ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+
+# Count
+aggregate(neut_count_med_pre2020 ~ group, df_group, mean)
+aggregate(neut_count_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = neut_count_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Neutrophils (median) boxplot for different groups")
+
+```
+
+## 3.18 C reactive protein
+```{r}
+# Anova
+res.aov <- aov(CRP_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# Count
+aggregate(CRP_med_pre2020 ~ group, df_group, mean)
+aggregate(CRP_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = CRP_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "C reactive protein (median) boxplot for different groups")
+
+```
+
+## 3.19 Cholesteol
+```{r}
+# Anova
+res.aov <- aov(Total_Cholesterol_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(Total_Cholesterol_med_pre2020 ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+# Count
+aggregate(Total_Cholesterol_med_pre2020 ~ group, df_group, mean)
+aggregate(Total_Cholesterol_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = Total_Cholesterol_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Cholesterol (median) boxplot for different groups")
+
+```
+
+## 3.20 Low Density Lipoprotein
+```{r}
+# Anova
+res.aov <- aov(LDL_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(LDL_med_pre2020 ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+
+# Count
+aggregate(LDL_med_pre2020 ~ group, df_group, mean)
+aggregate(LDL_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = LDL_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Low Density Lipoprotein (median) boxplot for different groups")
+
+```
+
+## 3.21 High Density Lipoprotein
+```{r}
+# Anova
+res.aov <- aov(HDL_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(HDL_med_pre2020 ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+# Count
+aggregate(HDL_med_pre2020 ~ group, df_group, mean)
+aggregate(HDL_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = HDL_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "High Density Lipoprotein (median) boxplot for different groups")
+
+```
+
+
+## 3.22 Ferritin
+```{r}
+# Anova
+res.aov <- aov(Ferritin_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(Ferritin_med_pre2020 ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+# Count
+aggregate(Ferritin_med_pre2020 ~ group, df_group, mean)
+aggregate(Ferritin_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = Ferritin_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Ferritin (median) boxplot for different groups")
+
+```
+
+
+## 3.23 LDH
+```{r}
+# Anova
+res.aov <- aov(LDH_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(LDH_med_pre2020 ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+# Count
+aggregate(LDH_med_pre2020 ~ group, df_group, mean)
+aggregate(LDH_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = LDH_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "LDH (median) boxplot for different groups")
+
+```
+
+
+## 3.24 Lactate
+```{r}
+# Anova
+res.aov <- aov(Lactate_med_pre2020 ~ group, data = df_group)
+summary(res.aov)
+
+# linear regression 
+fit <- lm(Lactate_med_pre2020 ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group)
+summary(fit)
+
+# Count
+aggregate(Lactate_med_pre2020 ~ group, df_group, mean)
+aggregate(Lactate_med_pre2020 ~ group, df_group, sd)
+
+# Boxplot
+ggplot(df_group, aes(x = group, y = Lactate_med_pre2020, color = group)) +
+        geom_jitter(alpha = 0.5) +
+        geom_boxplot(alpha = 0.5) +
+        labs(title = "Lactate (median) boxplot for different groups")
+
+```
+
+## 3.25 Ordinal level for Severity Measures *
+
+ordinal level 
+
+No hospitalization = 0
+
+Inpatient admission/emergency visit = 1
+
+ICU = 2
+
+Mechanical Ventilation = 3
+
+Intubation = 4
+
+Death = 5
+```{r}
+
+df_group$Ordinal <- rep("NA", nrow(df_group))
+
+df_group$Ordinal <- with(df_group, ifelse(
+  hasInpatientAdmissionAtOrAfterCovid == 0 &
+                 hasICUAdmissionAtOrAfterCovid == 0 &
+                 hasMechanicalVentilationAtOrAfterCovid == 0 &
+                 hasIntubationAtOrAfterCovid == 0 &
+                 Deceased == 0, 0, ifelse(
+  hasInpatientAdmissionAtOrAfterCovid == 1 &
+                 hasICUAdmissionAtOrAfterCovid == 0 &
+                 hasMechanicalVentilationAtOrAfterCovid == 0 &
+                 hasIntubationAtOrAfterCovid == 0 &
+                 Deceased == 0, 1, ifelse(
+                 hasICUAdmissionAtOrAfterCovid == 1 &
+                 hasMechanicalVentilationAtOrAfterCovid == 0 &
+                 hasIntubationAtOrAfterCovid == 0 &
+                 Deceased == 0, 2, ifelse(
+  hasMechanicalVentilationAtOrAfterCovid == 1 &
+                 hasIntubationAtOrAfterCovid == 0 &
+                 Deceased == 0, 3, ifelse(
+                 hasIntubationAtOrAfterCovid == 1 &
+                 Deceased == 0, 4, ifelse(
+                 Deceased == 1, 5, "NA"
+                 )))))))
+
+table(df_group$Ordinal)
+
+
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = as.character(df_group$Ordinal))
+res.chisq
+
+# Count
+df_group[, .N, .(group, Ordinal)][order(group, Ordinal)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+   geom_bar(aes(fill=as.character(Ordinal)),  position="dodge") +
+   labs(fill = "Severity Scale 1")
+```
+
+Severity_Scale level
+
+No hospitalization = 0
+
+Emergency visit/Inpatient admission = 1
+
+ICU/Mechanical Ventilation/Intubation = 2
+
+Death = 3
+```{r}
+
+df_group$Severity_Scale <- df_group$Ordinal
+
+table(df_group$Severity_Scale)
+df_group$Severity_Scale[df_group$Severity_Scale == 3] <- 2
+df_group$Severity_Scale[df_group$Severity_Scale == 4] <- 2
+df_group$Severity_Scale[df_group$Severity_Scale == 5] <- 3
+
+df_group[, .N, Severity_Scale][order(Severity_Scale)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, Severity_Scale)][order(group, Severity_Scale)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, Severity_Scale)][order(group, Severity_Scale)]%>% group_by(group) %>% mutate(percent = N/sum(N)*100) %>% print(digits = 3)
+
+
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = as.character(df_group$Severity_Scale))
+res.chisq
+
+df_group$Severity_Scale_f <- as.factor(df_group$Severity_Scale)
+
+# ordinal regression
+fit <- polr(Severity_Scale_f ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, Hess = TRUE)
+summary(fit)
+ctable <- coef(summary(fit))
+p <- pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2
+ctable <- cbind(ctable, "p value" = p)
+ctable
+ci <- confint(fit)
+ci
+exp(coef(fit))
+exp(cbind(OR = coef(fit), ci))
+
+# Count
+df_group[, .N, .(group, Severity_Scale)][order(group, Severity_Scale)]
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+   geom_bar(aes(fill=as.character(Severity_Scale)),  position="dodge") +
+   labs(fill = "Severity Scale 2")
+
+ggplot(data=df_group, aes(group))+
+  geom_bar(aes(fill=as.factor(Severity_Scale)), position="fill") +
+  theme(axis.text=element_text(size=16),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  labs(fill='default')
+
+ggsave("covid_severity_pct.tiff", path = fig_dir, width = 8, height = 6, device='tiff', dpi=500)
+
+```
+
+
+```{r}
+
+df_group$Ordinal_3 <- df_group$Ordinal
+
+table(df_group$Ordinal_3)
+df_group$Ordinal_3[df_group$Ordinal_3 == 1] <- 0
+df_group$Ordinal_3[df_group$Ordinal_3 == 2] <- 1
+df_group$Ordinal_3[df_group$Ordinal_3 == 3] <- 1
+df_group$Ordinal_3[df_group$Ordinal_3 == 4] <- 1
+df_group$Ordinal_3[df_group$Ordinal_3 == 5] <- 1
+
+table(df_group$Ordinal_3)
+
+# Chi-squared
+res.chisq <- chisq.test(x = df_group$group, y = as.character(df_group$Ordinal_3))
+res.chisq
+
+# Count
+df_group[, .N, .(group, Ordinal_3)][order(group, Ordinal_3)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+df_group[, .N, .(group, Ordinal_3)][order(group, Ordinal_3)]%>% group_by(group) %>% mutate(percent = N/sum(N)*100) %>% print(digits = 3)
+
+
+# logistic 
+df_group$Ordinal_3_n <- as.numeric(df_group$Ordinal_3)
+fit <- glm(Ordinal_3_n ~ group + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+# Plot
+ggplot(df_group, aes(x = group)) +
+   geom_bar(aes(fill=as.character(Ordinal_3)),  position="dodge") +
+   labs(fill = "Severity Scale 3")
+
+ggplot(data=df_group, aes(group))+
+  geom_bar(aes(fill=as.factor(Ordinal_3)), position="fill") +
+  theme(axis.text=element_text(size=16),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  labs(fill='default')
+
+ggsave("covid_severity_bin_pct.tiff", path = fig_dir, width = 8, height = 6, device='tiff', dpi=500)
+
+
+# logistic cluster 3 vs other
+fit <- glm(group_2 ~ Ordinal_3 + Age + Gender + Race + Ethnicity + BMI_med + hasSmokingBeforeCovid, data = df_group, family = 'binomial')
+summary(fit)
+
+```
+
+
+```{r}
+df_group_sub <- df_group[,c("hasInpatientAdmissionAtOrAfterCovid",
+                                "hasEmergencyVisitAtOrAfterCovid",
+                                "hasICUAdmissionAtOrAfterCovid",
+                                "hasMechanicalVentilationAtOrAfterCovid",
+                                "hasSupplementalOxygenAtOrAfterCovid",
+                                "hasIntubationAtOrAfterCovid",
+                                "Deceased",
+                                "Ordinal",
+                                "Severity_Scale",
+                                "Ordinal_3")]
+
+df_group_sub <- df_group_sub %>% mutate_if(is.integer, as.factor)
+str(df_group_sub)
+
+colnames(df_group_sub) <- c("Inpatient Admission (At/After)",
+                                "Emergency Visit (At/After)",
+                                "ICU Admission (At/After)",
+                                "Mechanical Ventilation (At/After)",
+                                "Supplemental Oxygen (At/After)",
+                                "Intubation (At/After)",
+                                "Deceased",
+                                "Severity_Scale_1",
+                                "Severity_Scale_2",
+                                "Severity_Scale_3")
+                                       
+table1(~ `Inpatient Admission (At/After)` + 
+         `Emergency Visit (At/After)` +
+         `ICU Admission (At/After)` +
+         `Mechanical Ventilation (At/After)` +
+         `Supplemental Oxygen (At/After)` +
+         `Intubation (At/After)` +
+         Deceased +
+         Severity_Scale_1 + Severity_Scale_2 + Severity_Scale_3 | group, data = df_group_sub, overall = F,
+       extra.col=list(`P-value`=pvalue))
+
+```
+
+Biobank
+```{r}
+df_group_sub <- df_group[,c("T1DM - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]",
+                            "T2DM - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]",
+                            "Asthma - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]",
+                            "COPD - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]",
+                            "Hypertension - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]",
+                            "MS - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]",
+                            "RA - current or past history (custom PPV) [>= 0.80PPV] [Existence (Yes/No)]",
+                            "Breast cancer - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]",
+                            "CD - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]",
+                            "UC - current or past history (custom PPV) [>= 0.85PPV] [Existence (Yes/No)]",
+                            "BD - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]",
+                            "Schizophrenia - current or past history (custom PPV) [>= 0.75PPV] [Existence (Yes/No)]"
+                                )]
+
+df_group_sub <- df_group_sub %>% mutate_if(is.integer, as.factor)
+str(df_group_sub)
+
+colnames(df_group_sub) <- c("T1D",
+                            "T2D",
+                            "Asthma",
+                            "COPD",
+                            "Hypertension",
+                            "Multiple Sclerosis",
+                            "Rheumatoid Arthritis",
+                            "Breast Cancer",
+                            "Crohns Disease",
+                            "Ulcerative Colitis",
+                            "Bipolar Disorder",
+                            "Schizophrenia")
+                                       
+table1(~ T1D + T2D + Asthma + COPD + Hypertension + `Multiple Sclerosis` + `Rheumatoid Arthritis` +
+         `Breast Cancer` + `Crohns Disease` + `Ulcerative Colitis` + 
+         `Bipolar Disorder` + `Schizophrenia` | group, data = df_group_sub, overall = F,
+          extra.col=list(`P-value`=pvalue))
+
+```
+
+
+# 5. Cluster Visualization
+
+## 5.1 Heatmap
+
+```{r}
+# Get Color 
+groupsort <- sort(group)
+
+col_group <- c()
+for (i in 1:length(groupsort)){
+  if (groupsort[i] == "Cluster 1"){
+    col_group <- c(col_group, "#d15034")
+  }
+  if (groupsort[i] == "Cluster 2"){
+    col_group <- c(col_group, "#f1ae2d")
+  }
+  if (groupsort[i] == "Cluster 3"){
+    col_group <- c(col_group, "#264a5f")
+  }
+}
+
+col_group <- unlist(col_group, use.names=FALSE)
+```
+
+```{r}
+# Visualization
+coul = colorRampPalette(brewer.pal(8,"Blues"))(100)
+
+ind <- sort(as.vector(group),index.return=TRUE)
+ind <- ind$ix
+
+W2 <- W[ind, ind]
+W2 <- diag0(W2)
+
+colnames(W2) = rep("",ncol(W2)) 
+rownames(W2) = rep("",nrow(W2))
+
+# View fused heatmap
+png(filename = here(fig_dir, "heatmap_1_1.png"), width = 1500, height = 1200)
+heatmap(W2, Colv = NA, Rowv = NA, col = coul, RowSideColors=col_group, ColSideColors=col_group)
+dev.off()
+
+# Neg heatmap
+W3 <- W_neg[ind, ind]
+W3 <- diag0(W3)
+
+colnames(W3) = rep("",ncol(W3)) 
+rownames(W3) = rep("",nrow(W3))
+
+png(filename = here(fig_dir, "heatmap_neg_1_1.png"), width = 1500, height = 1200)
+heatmap(W3, Colv = NA, Rowv = NA, col = coul)
+dev.off()
+
+# Polar heatmap
+W4 <- W_polar[ind, ind]
+W4 <- diag0(W4)
+
+colnames(W4) = rep("",ncol(W4)) 
+rownames(W4) = rep("",nrow(W4))
+
+png(filename = here(fig_dir, "heatmap_polar_1_1.png"), width = 1500, height = 1200)
+heatmap(W4, Colv = NA, Rowv = NA, col = coul)
+dev.off()
+
+# Pos Early heatmap
+W5 <- W_posearly[ind, ind]
+W5 <- diag0(W5)
+
+colnames(W5) = rep("",ncol(W5)) 
+rownames(W5) = rep("",nrow(W5))
+
+png(filename = here(fig_dir, "heatmap_posearly_1_1.png"), width = 1500, height = 1200)
+heatmap(W5, Colv = NA, Rowv = NA, col = coul)
+dev.off()
+
+# Pos Early heatmap
+W6 <- W_poslate[ind, ind]
+W6 <- diag0(W6)
+
+colnames(W6) = rep("",ncol(W6)) 
+rownames(W6) = rep("",nrow(W6))
+
+png(filename = here(fig_dir, "heatmap_poslate_1_1.png"), width = 1500, height = 1200)
+heatmap(W6, Colv = NA, Rowv = NA, col = coul)
+dev.off()
+```
+
+## 5.2 Network Plot
+```{r}
+set.seed(42)
+mat <- W
+mat[mat < 0.004] <- 0
+
+# View
+png(filename = here(fig_dir, "network_1_1.png"), width = 1500, height = 1200)
+qgraph(mat, layout='spring', vsize=1, groups = group, esize=0.1, fade = TRUE,
+       color = c("#d15034", "#f1ae2d", "#264a5f"
+                 # "#00BA38","#00C19F", "#00B9E3", "#619CFF", "#DB72FB", "#FF61C3"
+                 ),
+       posCol = "#ECECEC")
+dev.off()
+
+
+ggsave(here(fig_dir, "network_1_1.png"), width = 15, height = 12)
+
+
+```
+
+```{r}
+set.seed(42)
+mat <- W
+mat[mat < 0.0045] <- 0
+
+# View
+png(filename = here(fig_dir, "network_cutoff1_1_1.png"), width = 1500, height = 1200)
+qgraph(mat, layout='spring', vsize=1, groups = group, esize=0.15, fade = TRUE,
+       color = c("#d15034", "#f1ae2d", "#264a5f"
+                 # "#00BA38","#00C19F", "#00B9E3", "#619CFF", "#DB72FB", "#FF61C3"
+                 ),
+       posCol = "#ECECEC")
+dev.off()
+
+
+# ggsave(here(fig_dir, "network_cutoff1_1_1.png"), width = 15, height = 12)
+
+
+```
+
+# 6. Session info
+```{r}
+sessionInfo()
+```
