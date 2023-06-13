@@ -8,4 +8,6 @@
 
 ### R code
 #### 1_metabolomics_QC.Rmd: conduct quality control and calculated the basic statistic summary of metabolomics data from Metabolon Inc.
-#### 2_
+#### 2_SNF_parameter_selection.Rmd: conduct the parameter selection for SNF
+#### 3_SNF_preCOVID_metabolomics: conduct SNF for pre COVID metabolomics, including estimate the residuals of metabolites, SNF, leave-one-out cross validation, association with clinical phenotypes, regression analysis for clinical phenotypes
+#### 4_Recapitulate_afterCOVID_metabolomics.Rmd: conduct recapitulate for during/after COVID metabolomics, including estimate the residuals of metabolites, recapitulate, association with clinical phenotypes, regression analysis for clinical phenotypes
